@@ -1,10 +1,10 @@
 import os
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 
-# --- Config from environment ---
+# --- Environment configuration ---
 
 TODOIST_TOKEN = os.environ.get("TODOIST_TOKEN")
 BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY")
@@ -15,19 +15,24 @@ if not TODOIST_TOKEN:
 if not BACKEND_API_KEY:
     raise RuntimeError("BACKEND_API_KEY environment variable is not set")
 
-# --- FastAPI app ---
 
-app = FastAPI(title="Nick Todoist Backend", version="1.0.0")
+# --- FastAPI application ---
+
+app = FastAPI(
+    title="Nick Todoist Backend",
+    version="1.0.0",
+    description="Backend API for Nick's Personal OS integrating Todoist.",
+)
 
 
-# --- Simple API key auth that works with GPT ---
+# --- API key verification that works with GPT Actions ---
 
 async def verify_api_key(
     x_api_key: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
     """
-    Accept API key in either:
+    Accept API key either in:
     - X-API-KEY: <key>
     - Authorization: Bearer <key>
     - Authorization: <key>
@@ -52,15 +57,19 @@ async def verify_api_key(
 TODOIST_BASE_URL = "https://api.todoist.com/rest/v2"
 
 
-async def fetch_todoist_tasks(filter_value: Optional[str]) -> List[dict]:
+async def fetch_todoist_tasks(filter_value: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Fetch tasks from Todoist. If filter_value is provided and not 'all',
+    we forward it to Todoist's 'filter' query parameter.
+    """
     headers = {
         "Authorization": f"Bearer {TODOIST_TOKEN}",
         "Content-Type": "application/json",
     }
 
-    params = {}
-    # Map our enum to Todoist filter strings
+    params: Dict[str, Any] = {}
     if filter_value and filter_value != "all":
+        # Todoist supports natural language filters like "today", "overdue", etc.
         params["filter"] = filter_value
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -80,20 +89,27 @@ async def update_todoist_task(
     content: Optional[str] = None,
     due: Optional[str] = None,
     completed: Optional[bool] = None,
-) -> dict:
+) -> Dict[str, Any]:
+    """
+    Update a Todoist task. Uses /tasks/{id} for content/due,
+    and /tasks/{id}/close or /tasks/{id}/reopen for completion.
+    """
     headers = {
         "Authorization": f"Bearer {TODOIST_TOKEN}",
         "Content-Type": "application/json",
     }
 
-    payload: dict = {}
+    payload: Dict[str, Any] = {}
+
     if content is not None:
         payload["content"] = content
+
     if due is not None:
-        # Todoist expects "due_string" or a structured due object; we use due_string for simplicity.
+        # Todoist expects due_string or structured due; we use due_string for simplicity.
         payload["due_string"] = due
 
     async with httpx.AsyncClient(timeout=15.0) as client:
+        # Update basic fields first, if any
         if payload:
             resp = await client.post(
                 f"{TODOIST_BASE_URL}/tasks/{task_id}",
@@ -106,6 +122,7 @@ async def update_todoist_task(
                     detail=f"Todoist API error updating task: {resp.text}",
                 )
 
+        # Handle completion changes
         if completed is True:
             close_resp = await client.post(
                 f"{TODOIST_BASE_URL}/tasks/{task_id}/close", headers=headers
@@ -125,10 +142,10 @@ async def update_todoist_task(
                     detail=f"Todoist API error reopening task: {reopen_resp.text}",
                 )
 
-    # Fetch and return the updated task
-    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Finally fetch and return the updated task
         get_resp = await client.get(
-            f"{TODOIST_BASE_URL}/tasks/{task_id}", headers=headers
+            f"{TODOIST_BASE_URL}/tasks/{task_id}",
+            headers=headers,
         )
 
     if get_resp.status_code != 200:
@@ -140,25 +157,36 @@ async def update_todoist_task(
     return get_resp.json()
 
 
-# --- Routes matching your OpenAPI spec ---
+# --- Routes matching your GPT OpenAPI spec ---
 
 
-@app.get("/tasks", dependencies=[Depends(verify_api_key)])
+@app.get(
+    "/tasks",
+    dependencies=[Depends(verify_api_key)],
+)
 async def get_tasks(
     filter: Optional[Literal["today", "overdue", "upcoming", "all"]] = Query(
-        default=None
+        default=None,
+        description="Optional filter for tasks: today, overdue, upcoming, or all.",
     ),
 ):
+    """
+    Get tasks from Todoist, optionally filtered.
+    """
     tasks = await fetch_todoist_tasks(filter)
     return tasks
 
 
-@app.patch("/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
-async def update_task(
-    task_id: str,
-    body: dict,
-):
+@app.patch(
+    "/tasks/{task_id}",
+    dependencies=[Depends(verify_api_key)],
+)
+async def update_task(task_id: str, body: Dict[str, Any]):
+    """
+    Update a specific Todoist task's content, due date, or completion state.
+    """
     content = body.get("content")
+    # Support both 'due' and 'due_string' in the incoming body
     due = body.get("due") or body.get("due_string")
     completed = body.get("completed")
 
